@@ -27,14 +27,14 @@ public class Migrate
     public static void main(String ...args) throws ClassNotFoundException, IllegalAccessException, InstantiationException, SQLException, ParseException
     {
         Options options = new Options();
-        options.addOption("t", false, "target team handle");
-        options.addOption("h", false, "postgresql database host");
-        options.addOption("u", false, "database username");
-        options.addOption("p", false, "database password");
-        options.addOption("d", false, "database name");
-        options.addOption("r", false, "database port");
-        options.addOption("a", false, "admin email address");
-        options.addOption("m", false, "allowed email domains (pipe seperated)");
+        options.addOption("t", true, "target team handle");
+        options.addOption("h", true, "postgresql database host");
+        options.addOption("u", true, "database username");
+        options.addOption("p", true, "database password");
+        options.addOption("d", true, "database name");
+        options.addOption("r", true, "database port");
+        options.addOption("a", true, "admin email address");
+        options.addOption("m", true, "allowed email domains (pipe seperated)");
 
         CommandLineParser parser = new DefaultParser();
         CommandLine cmd = parser.parse( options, args);
