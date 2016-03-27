@@ -1,3 +1,12 @@
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.DefaultParser;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
+
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -9,33 +18,47 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Created by Renjith Pillai (i306570) on 18/03/16.
+ * Created by Renjith Pillai on 18/03/16.
  */
 
 
 public class Migrate
 {
-    private static final String TARGET_TEAM_ID = "ariba";
-
-    public static void main(String ...args) throws ClassNotFoundException, IllegalAccessException, InstantiationException, SQLException
+    public static void main(String ...args) throws ClassNotFoundException, IllegalAccessException, InstantiationException, SQLException, ParseException
     {
+        Options options = new Options();
+        options.addOption("t", false, "target team handle");
+        options.addOption("h", false, "postgresql database host");
+        options.addOption("u", false, "database username");
+        options.addOption("p", false, "database password");
+        options.addOption("d", false, "database name");
+        options.addOption("r", false, "database port");
+        options.addOption("a", false, "admin email address");
+        options.addOption("m", false, "allowed email domains (pipe seperated)");
+
+        CommandLineParser parser = new DefaultParser();
+        CommandLine cmd = parser.parse( options, args);
         Class.forName("org.postgresql.Driver").newInstance();
 
         Connection conn = null;
 
         try {
-            conn = DriverManager.getConnection("jdbc:postgresql://localhost:5432/i306570", "i306570", "ariba");
+            conn = DriverManager.getConnection(String.format("jdbc:postgresql://%s:%s/%s",
+                    cmd.getOptionValue("h"), cmd.getOptionValue("r"), cmd.getOptionValue("d")),
+                    cmd.getOptionValue("u"), cmd.getOptionValue("p"));
 
             //Update all usernames
-            exst(conn, "DELETE FROM CHANNELMEMBERS WHERE userid IN (SELECT id FROM USERS WHERE lower(email) NOT SIMILAR TO '%(sap.com|ariba.com)')");
-            exst(conn, "DELETE FROM POSTS WHERE userid IN (SELECT id FROM USERS WHERE lower(email) NOT SIMILAR TO '%(sap.com|ariba.com)')");
-            exst(conn, "DELETE FROM USERS WHERE lower(email) NOT SIMILAR TO '%(sap.com|ariba.com)'");
+            exst(conn, String.format("DELETE FROM CHANNELMEMBERS WHERE userid IN (SELECT id FROM USERS WHERE lower(email) NOT SIMILAR TO '%(%s)')", cmd.getOptionValue("m")));
+            exst(conn, String.format("DELETE FROM POSTS WHERE userid IN (SELECT id FROM USERS WHERE lower(email) NOT SIMILAR TO '%(%s)')", cmd.getOptionValue("m")));
+            exst(conn, String.format("DELETE FROM USERS WHERE lower(email) NOT SIMILAR TO '%(%s)'", cmd.getOptionValue("m")));
+
+            //Update all userids to email address left part
             exst(conn, "UPDATE USERS SET username = lower(substring(email from '#\"%#\"@%' for '#'));");
 
             //User updates
             final List<User> allUsers = getAllUsers(conn);
             final List<String> distinctEmailIDs = getDistinctEmailIDs(conn);
-            final String targetTeamId = getTargetTeamId(conn);
+            final String targetTeamId = getTargetTeamId(conn, cmd.getOptionValue("t"));
             final Map<String, User> targetExistingMembers = getExistingMembers(conn, targetTeamId);
 
             final Map<String, String> oldVsNewUser = new HashMap<String, String>();
@@ -116,8 +139,8 @@ public class Migrate
                 }
             }
 
-            final List<Channel> nonTargetPrivateChannels = getNonTargetPrivateChannels(conn, targetTeamId);
-            for (Channel channel : nonTargetPrivateChannels)
+            final List<Channel> nonTargetDirectChannels = getNonTargetDirectChannels(conn, targetTeamId);
+            for (Channel channel : nonTargetDirectChannels)
             {
                 if(!areThereMatchingUserIds(channel.getName(), oldVsNewUser))
                 {
@@ -146,6 +169,16 @@ public class Migrate
                 }
             }
 
+            //Private channels
+            final List<Channel> nonTargetPrivateChannels = getNonTargetPrivateChannels(conn, targetTeamId);
+            for (Channel channel : nonTargetPrivateChannels)
+            {
+                exst(conn, String.format("UPDATE CHANNELS SET teamid = '%s' " +
+                                ", creatorid = '%s' WHERE id = '%s'",
+                        targetTeamId,
+                        oldVsNewUser.get(channel.getCreatorId()),
+                        channel.getId()));
+            }
 
             //Update userid in audits - Moved to delete
 
@@ -157,9 +190,13 @@ public class Migrate
                         oldVsNewUser.get(entry.getValue()),
                         entry.getKey()));
             }
+            exst(conn, String.format("UPDATE INCOMINGWEBHOOKS SET teamid = '%s'", targetTeamId));
 
             //Update name and userid in preferences
             updatePreferences(conn,oldVsNewUser);
+
+            //Update channelmembers for userid
+            updateChannelMembers(conn, oldVsNewUser);
 
             //Update creatorid in oauthapps - ignore zero rows
             //Update userid in oauthauthdata - ignore zero rows
@@ -185,6 +222,22 @@ public class Migrate
             exst(conn, "DELETE FROM SESSIONS");
             exst(conn, "DELETE FROM AUDITS");
 
+            //Misc
+            exst(conn, String.format("UPDATE users SET roles = 'system_admin' where email = '%s'", cmd.getOptionValue("a")));
+
+            //Add all users to town-square of Target team
+            String channelId = getTownSquareOfTargetTeam(conn, targetTeamId);
+            List<String> newMembers = getNewMembersOfTarget(conn, channelId);
+            for (String newMember : newMembers)
+            {
+                exst(conn, String.format(
+                        "INSERT INTO channelmembers VALUES('%s','%s','',0,0,0,'{\"desktop\":\"default\",\"mark_unread\":\"all\"}', 0)",
+                        channelId, newMember));
+            }
+
+
+            //Write statements to file
+            writetofile(statements);
 
             final List<Channel> newNonTargetPrivateChannels = getAllPrivateChannels(conn);
             for (Channel channel : newNonTargetPrivateChannels)
@@ -203,6 +256,52 @@ public class Migrate
             System.out.println("SQLState: " + ex.getSQLState());
             System.out.println("VendorError: " + ex.getErrorCode());
         }
+        catch (IOException e)
+        {
+            e.printStackTrace();
+        }
+    }
+
+    private static List<String> getNewMembersOfTarget(Connection conn, String channelId) throws SQLException
+    {
+        Statement st = conn.createStatement();
+        final ResultSet rs = st.executeQuery(String.format("SELECT id, email FROM users WHERE id NOT IN " +
+                "(SELECT userid FROM channelmembers WHERE channelid = '%s')", channelId));
+        List<String> newMembers = new ArrayList<String>();
+        while(rs.next())
+        {
+            newMembers.add(rs.getString("id"));
+        }
+        return newMembers;
+    }
+
+    private static String getTownSquareOfTargetTeam(Connection conn, String targetTeamId) throws SQLException
+    {
+        Statement st = conn.createStatement();
+        final ResultSet rs = st.executeQuery(String.format("SELECT id FROM channels WHERE name = 'town-square' AND teamid = '%s'", targetTeamId));
+        rs.next();
+        return rs.getString("id");
+    }
+
+    private static void updateChannelMembers(Connection conn, Map<String, String> oldVsNewUser) throws SQLException
+    {
+        Statement st = conn.createStatement();
+        final ResultSet rs = st.executeQuery("SELECT * FROM channelmembers");
+
+        while(rs.next())
+        {
+            final String userid = rs.getString("userid");
+            final String channelid = rs.getString("channelid");
+            try
+            {
+                exst(conn, String.format("UPDATE channelmembers SET userid = '%s' WHERE userid = '%s' AND channelid = '%s'",
+                        oldVsNewUser.get(userid), userid, channelid));
+            }
+            catch (Exception e)
+            {
+                System.out.println(e.getMessage());
+            }
+        }
     }
 
     private static void updatePreferences(Connection conn, Map<String, String> oldVsNewUser) throws SQLException
@@ -214,8 +313,17 @@ public class Migrate
         {
             final String userid = rs.getString("userid");
             final String name = rs.getString("name");
-            exst(conn, String.format("UPDATE PREFERENCES SET userid = '%s' WHERE userid = '%s'", oldVsNewUser.get(userid), userid));
-            exst(conn, String.format("UPDATE PREFERENCES SET name = '%s' WHERE name = '%s'", oldVsNewUser.get(name), name));
+            try
+            {
+                exst(conn, String.format("UPDATE PREFERENCES SET userid = '%s' WHERE userid = '%s' AND name = '%s'",
+                        oldVsNewUser.get(userid), userid, name));
+                exst(conn, String.format("UPDATE PREFERENCES SET name = '%s' WHERE userid = '%s' AND name = '%s'",
+                        oldVsNewUser.get(name), userid, name));
+            }
+            catch (Exception e)
+            {
+                System.out.println(e.getMessage());
+            }
         }
     }
 
@@ -326,7 +434,7 @@ public class Migrate
         return data;
     }
 
-    private static List<Channel> getNonTargetPrivateChannels(Connection conn, String targetTeamId) throws SQLException
+    private static List<Channel> getNonTargetDirectChannels(Connection conn, String targetTeamId) throws SQLException
     {
         List<Channel> data = new ArrayList<Channel>();
         Statement st = conn.createStatement();
@@ -334,6 +442,30 @@ public class Migrate
                 "channels.name cn, channels.teamid ctid, channels.creatorid ccid," +
                 "teams.name tn, teams.displayname tdn from CHANNELS,TEAMS where CHANNELS.teamid = TEAMS.id AND " +
                 "channels.type = 'D' AND " +
+                "channels.teamid != '" + targetTeamId + "'");
+        while(rs.next())
+        {
+            data.add(new Channel(
+                    rs.getString("cdn"),
+                    rs.getString("cn"),
+                    rs.getString("ctid"),
+                    rs.getString("cid"),
+                    rs.getString("ccid"),
+                    rs.getString("tn"),
+                    rs.getString("tdn"))
+            );
+        }
+        return data;
+    }
+
+    private static List<Channel> getNonTargetPrivateChannels(Connection conn, String targetTeamId) throws SQLException
+    {
+        List<Channel> data = new ArrayList<Channel>();
+        Statement st = conn.createStatement();
+        ResultSet rs = st.executeQuery("SELECT channels.id cid, channels.displayname cdn, " +
+                "channels.name cn, channels.teamid ctid, channels.creatorid ccid," +
+                "teams.name tn, teams.displayname tdn from CHANNELS,TEAMS where CHANNELS.teamid = TEAMS.id AND " +
+                "channels.type = 'P' AND " +
                 "channels.teamid != '" + targetTeamId + "'");
         while(rs.next())
         {
@@ -372,12 +504,28 @@ public class Migrate
         }
         return data;
     }
+    private static List<String> statements = new ArrayList<String>();
 
     private static void exst(Connection conn, String statement) throws SQLException
     {
         System.out.println(statement + ";");
+        statements.add(statement);
         final Statement stmt = conn.createStatement();
         stmt.execute(statement);
+    }
+
+    private static void writetofile(List<String> statements) throws IOException
+    {
+        FileWriter fstream = new FileWriter("/tmp/migrate.sql", true);
+        BufferedWriter out = new BufferedWriter(fstream);
+        for (String statement : statements)
+        {
+            out.write((statement + ";").toString());
+            out.newLine();
+        }
+
+        //Close the output stream
+        out.close();
     }
 
     private static Map<String, User> getExistingMembers(Connection conn, String targetTeamId) throws SQLException
@@ -403,10 +551,10 @@ public class Migrate
         return data;
     }
 
-    private static String getTargetTeamId(Connection conn) throws SQLException
+    private static String getTargetTeamId(Connection conn, String targetTeamHandle) throws SQLException
     {
         Statement st = conn.createStatement();
-        ResultSet rs = st.executeQuery("SELECT id,name,displayname from TEAMS where name='" + TARGET_TEAM_ID + "'");
+        ResultSet rs = st.executeQuery("SELECT id,name,displayname from TEAMS where name='" + targetTeamHandle + "'");
         rs.next();
         return rs.getString("id");
     }
